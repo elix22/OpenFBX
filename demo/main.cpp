@@ -76,9 +76,9 @@ void showGUI(const ofbx::IElement& parent)
 		strcat_s(label, ")");
 
 		ImGui::PushID((const void*)id.begin);
-		ImGuiTreeElementFlags flags = g_selected_element == element ? ImGuiTreeElementFlags_Selected : 0;
-		if (!element->getFirstChild()) flags |= ImGuiTreeElementFlags_Leaf;
-		if (ImGui::TreeElementEx(label, flags))
+		ImGuiTreeNodeFlags flags = g_selected_element == element ? ImGuiTreeNodeFlags_Selected : 0;
+		if (!element->getFirstChild()) flags |= ImGuiTreeNodeFlags_Leaf;
+		if (ImGui::TreeNodeEx(label, flags))
 		{
 			if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) g_selected_element = element;
 			if (element->getFirstChild()) showGUI(*element);
@@ -138,6 +138,19 @@ void showGUI(ofbx::IElementProperty& prop)
 }
 
 
+static void showCurveGUI(const ofbx::Object& object) {
+    const ofbx::AnimationCurve& curve = static_cast<const ofbx::AnimationCurve&>(object);
+    
+    const int c = curve.getKeyCount();
+    for (int i = 0; i < c; ++i) {
+        const float t = (float)ofbx::fbxTimeToSeconds(curve.getKeyTime()[i]);
+        const float v = curve.getKeyValue()[i];
+        ImGui::Text("%fs: %f ", t, v);
+        
+    }
+}
+
+
 void showObjectGUI(const ofbx::Object& object)
 {
 	const char* label;
@@ -160,10 +173,10 @@ void showObjectGUI(const ofbx::Object& object)
 		default: assert(false); break;
 	}
 
-	ImGuiTreeElementFlags flags = g_selected_object == &object ? ImGuiTreeElementFlags_Selected : 0;
+	ImGuiTreeNodeFlags flags = g_selected_object == &object ? ImGuiTreeNodeFlags_Selected : 0;
 	char tmp[128];
 	sprintf_s(tmp, "%" PRId64 " %s (%s)", object.id, object.name, label);
-	if (ImGui::TreeElementEx(tmp, flags))
+	if (ImGui::TreeNodeEx(tmp, flags))
 	{
 		if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) g_selected_object = &object;
 		int i = 0;
@@ -172,6 +185,10 @@ void showObjectGUI(const ofbx::Object& object)
 			showObjectGUI(*child);
 			++i;
 		}
+        if(object.getType() == ofbx::Object::Type::ANIMATION_CURVE) {
+            showCurveGUI(object);
+        }
+
 		ImGui::TreePop();
 	}
 	else
@@ -228,7 +245,7 @@ bool saveAsOBJ(ofbx::IScene& scene, const char* path)
 		if (has_normals)
 		{
 			const ofbx::Vec3* normals = geom.getNormals();
-			int count = geom.getVertexCount();
+			int count = geom.getIndexCount();
 
 			for (int i = 0; i < count; ++i)
 			{
@@ -241,7 +258,7 @@ bool saveAsOBJ(ofbx::IScene& scene, const char* path)
 		if (has_uvs)
 		{
 			const ofbx::Vec2* uvs = geom.getUVs();
-			int count = geom.getVertexCount();
+			int count = geom.getIndexCount();
 
 			for (int i = 0; i < count; ++i)
 			{
@@ -250,42 +267,46 @@ bool saveAsOBJ(ofbx::IScene& scene, const char* path)
 			}
 		}
 
+		const int* faceIndices = geom.getFaceIndices();
+		int index_count = geom.getIndexCount();
 		bool new_face = true;
-		int count = geom.getVertexCount();
-		for (int i = 0; i < count; ++i)
+		for (int i = 0; i < index_count; ++i)
 		{
 			if (new_face)
 			{
 				fputs("f ", fp);
 				new_face = false;
 			}
-			int idx = i + 1;
+			int idx = (faceIndices[i] < 0) ? -faceIndices[i] : (faceIndices[i] + 1);
 			int vertex_idx = indices_offset + idx;
 			fprintf(fp, "%d", vertex_idx);
 
-			if (has_normals)
-			{
-				fprintf(fp, "/%d", idx);
-			}
-			else
-			{
-				fprintf(fp, "/");
-			}
-
 			if (has_uvs)
 			{
-				fprintf(fp, "/%d", idx);
+				int uv_idx = normals_offset + i + 1;
+				fprintf(fp, "/%d", uv_idx);
 			}
 			else
 			{
 				fprintf(fp, "/");
 			}
 
-			new_face = idx < 0;
+			if (has_normals)
+			{
+				int normal_idx = normals_offset + i + 1;
+				fprintf(fp, "/%d", normal_idx);
+			}
+			else
+			{
+				fprintf(fp, "/");
+			}
+
+			new_face = faceIndices[i] < 0;
 			fputc(new_face ? '\n' : ' ', fp);
 		}
 
 		indices_offset += vertex_count;
+		normals_offset += index_count;
 		++obj_idx;
 	}
 	fclose(fp);
@@ -301,11 +322,17 @@ void onGUI()
 	io.KeyCtrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 	io.KeyCtrl = (GetKeyState(VK_MENU) & 0x8000) != 0;
 
+	RECT rect;
+	BOOL status = GetClientRect(g_hWnd, &rect);
+
+	io.DisplaySize.x = float(rect.right - rect.left);
+	io.DisplaySize.y = float(rect.bottom - rect.top);
+
 	ImGui::NewFrame();
 
 	if (g_scene)
 	{
-		ImGui::RootDock(ImVec2(0, 0), ImGui::GetIO().DisplaySize);
+//		ImGui::RootDock(ImVec2(0, 0), ImGui::GetIO().DisplaySize);
 		if (ImGui::Begin("Elements"))
 		{
 			const ofbx::IElement* root = g_scene->getRootElement();
@@ -329,6 +356,7 @@ void onGUI()
 
 void onResize(int width, int height)
 {
+	if (!ImGui::GetCurrentContext()) return;
 	auto& io = ImGui::GetIO();
 	io.DisplaySize.x = (float)width;
 	io.DisplaySize.y = (float)height;
@@ -516,9 +544,12 @@ void imGUICallback(ImDrawData* draw_data)
 
 void initImGUI()
 {
+	ImGuiContext* ctx = ImGui::CreateContext();
+	ImGui::SetCurrentContext(ctx);
 	ImGuiIO& io = ImGui::GetIO();
 	unsigned char* pixels;
 	int width, height;
+	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 	io.Fonts->GetTexDataAsAlpha8(&pixels, &width, &height);
 	glEnable(GL_TEXTURE_2D);
 	glGenTextures(1, &g_font_texture);
@@ -553,9 +584,9 @@ void initImGUI()
 }
 
 
-bool init()
+bool init(const char* filepath)
 {
-	g_hWnd = CreateOpenGLWindow("minimal", 0, 0, 800, 600, PFD_TYPE_RGBA, 0);
+	g_hWnd = CreateOpenGLWindow("openfbx info viewer", 0, 0, 800, 600, PFD_TYPE_RGBA, 0);
 	if (g_hWnd == NULL) return false;
 
 	g_hDC = GetDC(g_hWnd);
@@ -565,7 +596,8 @@ bool init()
 	ShowWindow(g_hWnd, SW_SHOW);
 	initImGUI();
 
-	FILE* fp = fopen("c.fbx", "rb");
+	FILE* fp = fopen(filepath, "rb");
+
 	if (!fp) return false;
 
 	fseek(fp, 0, SEEK_END);
@@ -573,8 +605,13 @@ bool init()
 	fseek(fp, 0, SEEK_SET);
 	auto* content = new ofbx::u8[file_size];
 	fread(content, 1, file_size, fp);
-	g_scene = ofbx::load((ofbx::u8*)content, file_size);
-	saveAsOBJ(*g_scene, "out.obj");
+	g_scene = ofbx::load((ofbx::u8*)content, file_size, (ofbx::u64)ofbx::LoadFlags::TRIANGULATE);
+	if(!g_scene) {
+        OutputDebugString(ofbx::getError());
+    }
+    else {
+        saveAsOBJ(*g_scene, "out.obj");
+    }
 	delete[] content;
 	fclose(fp);
 
@@ -584,8 +621,23 @@ bool init()
 
 INT WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, INT)
 {
-	init();
-
+	// load either from command line arguments or loads a default file
+	{
+		LPWSTR* szArgList;
+		int argCount;
+		char filepath[2048];
+		szArgList = CommandLineToArgvW(GetCommandLineW(), &argCount);
+		if (argCount == 1)
+		{
+			strcpy(filepath,"b.fbx");
+		}
+		for (int i = 1; i < argCount; i++)
+		{
+			wcstombs(filepath, szArgList[i], wcslen(szArgList[i]));
+		}
+		init(filepath);
+		LocalFree(szArgList);
+	}
 	bool finished = false;
 	while (!finished)
 	{

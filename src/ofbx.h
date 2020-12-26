@@ -8,13 +8,28 @@ namespace ofbx
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
-typedef unsigned long long u64;
-typedef long long i64;
+#ifdef _WIN32
+	typedef long long i64;
+	typedef unsigned long long u64;
+#else
+	typedef long i64;
+	typedef unsigned long u64;
+#endif
 
 static_assert(sizeof(u8) == 1, "u8 is not 1 byte");
 static_assert(sizeof(u32) == 4, "u32 is not 4 bytes");
 static_assert(sizeof(u64) == 8, "u64 is not 8 bytes");
 static_assert(sizeof(i64) == 8, "i64 is not 8 bytes");
+
+
+using JobFunction = void (*)(void*);
+using JobProcessor = void (*)(JobFunction, void*, void*, u32, u32);
+
+enum class LoadFlags : u64 {
+	TRIANGULATE = 1 << 0,
+	IGNORE_GEOMETRY = 1 << 1,
+	IGNORE_BLEND_SHAPES = 1 << 2,
+};
 
 
 struct Vec2
@@ -68,7 +83,7 @@ struct DataView
 	u32 toU32() const;
 	double toDouble() const;
 	float toFloat() const;
-	
+
 	template <int N>
 	void toString(char(&out)[N]) const
 	{
@@ -97,7 +112,8 @@ struct IElementProperty
 		ARRAY_DOUBLE = 'd',
 		ARRAY_INT = 'i',
 		ARRAY_LONG = 'l',
-		ARRAY_FLOAT = 'f'
+		ARRAY_FLOAT = 'f',
+		BINARY = 'R'
 	};
 	virtual ~IElementProperty() {}
 	virtual Type getType() const = 0;
@@ -114,6 +130,7 @@ struct IElementProperty
 
 struct IElement
 {
+    virtual ~IElement() = default;
 	virtual IElement* getFirstChild() const = 0;
 	virtual IElement* getSibling() const = 0;
 	virtual DataView getID() const = 0;
@@ -121,14 +138,15 @@ struct IElement
 };
 
 
-enum class RotationOrder {
+enum class RotationOrder
+{
 	EULER_XYZ,
 	EULER_XZY,
 	EULER_YZX,
 	EULER_YXZ,
 	EULER_ZXY,
 	EULER_ZYX,
-    SPHERIC_XYZ // Currently unsupported. Treated as EULER_XYZ.
+	SPHERIC_XYZ // Currently unsupported. Treated as EULER_XYZ.
 };
 
 
@@ -144,6 +162,7 @@ struct Object
 	{
 		ROOT,
 		GEOMETRY,
+		SHAPE,
 		MATERIAL,
 		MESH,
 		TEXTURE,
@@ -152,24 +171,27 @@ struct Object
 		NODE_ATTRIBUTE,
 		CLUSTER,
 		SKIN,
+		BLEND_SHAPE,
+		BLEND_SHAPE_CHANNEL,
 		ANIMATION_STACK,
 		ANIMATION_LAYER,
 		ANIMATION_CURVE,
-		ANIMATION_CURVE_NODE
+		ANIMATION_CURVE_NODE,
+		POSE
 	};
 
 	Object(const Scene& _scene, const IElement& _element);
 
 	virtual ~Object() {}
 	virtual Type getType() const = 0;
-	
+
 	const IScene& getScene() const;
 	Object* resolveObjectLink(int idx) const;
 	Object* resolveObjectLink(Type type, const char* property, int idx) const;
 	Object* resolveObjectLinkReverse(Type type) const;
 	Object* getParent() const;
 
-    RotationOrder getRotationOrder() const;
+	RotationOrder getRotationOrder() const;
 	Vec3 getRotationOffset() const;
 	Vec3 getRotationPivot() const;
 	Vec3 getPostRotation() const;
@@ -202,13 +224,26 @@ protected:
 };
 
 
+struct Pose : Object {
+	static const Type s_type = Type::POSE;
+	Pose(const Scene& _scene, const IElement& _element);
+
+	virtual Matrix getMatrix() const = 0;
+	virtual const Object* getNode() const = 0;
+};
+
+
 struct Texture : Object
 {
 	enum TextureType
 	{
 		DIFFUSE,
 		NORMAL,
-
+		SPECULAR,
+        SHININESS,
+        AMBIENT,
+        EMISSIVE,
+        REFLECTION,
 		COUNT
 	};
 
@@ -217,6 +252,7 @@ struct Texture : Object
 	Texture(const Scene& _scene, const IElement& _element);
 	virtual DataView getFileName() const = 0;
 	virtual DataView getRelativeFileName() const = 0;
+	virtual DataView getEmbeddedData() const = 0;
 };
 
 
@@ -227,6 +263,20 @@ struct Material : Object
 	Material(const Scene& _scene, const IElement& _element);
 
 	virtual Color getDiffuseColor() const = 0;
+	virtual Color getSpecularColor() const = 0;
+    virtual Color getReflectionColor() const = 0;
+    virtual Color getAmbientColor() const = 0;
+    virtual Color getEmissiveColor() const = 0;
+
+    virtual double getDiffuseFactor() const = 0;
+    virtual double getSpecularFactor() const = 0;
+    virtual double getReflectionFactor() const = 0;
+    virtual double getShininess() const = 0;
+    virtual double getShininessExponent() const = 0;
+    virtual double getAmbientFactor() const = 0;
+    virtual double getBumpFactor() const = 0;
+    virtual double getEmissiveFactor() const = 0;
+
 	virtual const Texture* getTexture(Texture::TextureType type) const = 0;
 };
 
@@ -258,6 +308,29 @@ struct Skin : Object
 };
 
 
+struct BlendShapeChannel : Object
+{
+	static const Type s_type = Type::BLEND_SHAPE_CHANNEL;
+
+	BlendShapeChannel(const Scene& _scene, const IElement& _element);
+
+	virtual double getDeformPercent() const = 0;
+	virtual int getShapeCount() const = 0;
+	virtual const struct Shape* getShape(int idx) const = 0;
+};
+
+
+struct BlendShape : Object
+{
+	static const Type s_type = Type::BLEND_SHAPE;
+
+	BlendShape(const Scene& _scene, const IElement& _element);
+
+	virtual int getBlendShapeChannelCount() const = 0;
+	virtual const BlendShapeChannel* getBlendShapeChannel(int idx) const = 0;
+};
+
+
 struct NodeAttribute : Object
 {
 	static const Type s_type = Type::NODE_ATTRIBUTE;
@@ -271,19 +344,36 @@ struct NodeAttribute : Object
 struct Geometry : Object
 {
 	static const Type s_type = Type::GEOMETRY;
-    static const int s_uvs_max = 4;
+	static const int s_uvs_max = 4;
 
 	Geometry(const Scene& _scene, const IElement& _element);
 
 	virtual const Vec3* getVertices() const = 0;
 	virtual int getVertexCount() const = 0;
 
+	virtual const int* getFaceIndices() const = 0;
+	virtual int getIndexCount() const = 0;
+
 	virtual const Vec3* getNormals() const = 0;
 	virtual const Vec2* getUVs(int index = 0) const = 0;
 	virtual const Vec4* getColors() const = 0;
 	virtual const Vec3* getTangents() const = 0;
 	virtual const Skin* getSkin() const = 0;
+	virtual const BlendShape* getBlendShape() const = 0;
 	virtual const int* getMaterials() const = 0;
+};
+
+
+struct Shape : Object
+{
+	static const Type s_type = Type::SHAPE;
+
+	Shape(const Scene& _scene, const IElement& _element);
+
+	virtual const Vec3* getVertices() const = 0;
+	virtual int getVertexCount() const = 0;
+
+	virtual const Vec3* getNormals() const = 0;
 };
 
 
@@ -293,6 +383,7 @@ struct Mesh : Object
 
 	Mesh(const Scene& _scene, const IElement& _element);
 
+	virtual const Pose* getPose() const = 0;
 	virtual const Geometry* getGeometry() const = 0;
 	virtual Matrix getGeometricMatrix() const = 0;
 	virtual const Material* getMaterial(int idx) const = 0;
@@ -338,6 +429,7 @@ struct AnimationCurveNode : Object
 
 	AnimationCurveNode(const Scene& _scene, const IElement& _element);
 
+	virtual const AnimationCurve* getCurve(int idx) const = 0; 
 	virtual Vec3 getNodeLocalTransform(double time) const = 0;
 	virtual const Object* getBone() const = 0;
 };
@@ -357,17 +449,17 @@ struct TakeInfo
 // Specifies which canonical axis represents up in the system (typically Y or Z).
 enum UpVector
 {
-	UpVector_AxisX = 1,
-	UpVector_AxisY = 2,
-	UpVector_AxisZ = 3
+	UpVector_AxisX = 0,
+	UpVector_AxisY = 1,
+	UpVector_AxisZ = 2
 };
 
 
 // Vector with origin at the screen pointing toward the camera.
 enum FrontVector
 {
-	FrontVector_ParityEven = 1,
-	FrontVector_ParityOdd = 2
+	FrontVector_ParityEven = 0,
+	FrontVector_ParityOdd = 1
 };
 
 
@@ -412,8 +504,8 @@ struct GlobalSettings
 	int OriginalUpAxisSign = 1;
 	float UnitScaleFactor = 1;
 	float OriginalUnitScaleFactor = 1;
-	u64 TimeSpanStart = 0L;
-	u64 TimeSpanStop = 0L;
+	double TimeSpanStart = 0L;
+	double TimeSpanStop = 0L;
 	FrameRate TimeMode = FrameRate_DEFAULT;
 	float CustomFrameRate = -1.0f;
 };
@@ -431,16 +523,21 @@ struct IScene
 	virtual const Mesh* getMesh(int index) const = 0;
 	virtual int getAnimationStackCount() const = 0;
 	virtual const AnimationStack* getAnimationStack(int index) const = 0;
-	virtual const Object *const * getAllObjects() const = 0;
+	virtual const Object* const* getAllObjects() const = 0;
 	virtual int getAllObjectCount() const = 0;
+	virtual int getEmbeddedDataCount() const = 0;
+	virtual DataView getEmbeddedData(int index) const = 0;
+	virtual DataView getEmbeddedFilename(int index) const = 0;
 
 protected:
 	virtual ~IScene() {}
 };
 
 
-IScene* load(const u8* data, int size);
+IScene* load(const u8* data, int size, u64 flags, JobProcessor job_processor = nullptr, void* job_user_ptr = nullptr);
 const char* getError();
+double fbxTimeToSeconds(i64 value);
+i64 secondsToFbxTime(double value);
 
 
 } // namespace ofbx
